@@ -33,7 +33,7 @@ const CACHE_TTL = 10 * 60 * 1000;    // how long a "Show More" stays valid
 
 // ---------------------------------------------------------------- transport
 
-async function tg(method, body, ms = 20000) {
+async function tg(method, body, ms = 60000) {
   if (!TOKEN) return null;
   try {
     const r = await fetch(API + '/bot' + TOKEN + '/' + method, {
