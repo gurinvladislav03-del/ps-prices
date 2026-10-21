@@ -1,56 +1,38 @@
 // Telegram front end for the same price lookup the website uses.
 //
-// It shares server.js outright -- the catalogue, the resolver, the extractor,
-// the cross-region reconciliation -- so a fix to prices is a fix here too, and
-// there is no second copy of any of it to drift.
+// It shares server.js outright (catalogue, resolver, extractor, cross-region
+// reconciliation), so a fix to prices is a fix here too.
 //
-// Three ways in, because Telegram has no equivalent of a text box with a
-// dropdown under it:
+//   INLINE     "@yourbot ghost" in any chat gives a live list of titles.
+//   BUTTONS    Sending a title prices it; several matches are offered as buttons.
+//   EDITIONS   After a game is priced, its editions are offered as a menu.
+//              Picking one prices that exact edition in every region.
+//   COMMANDS   /start, /help, /top, /new, /cur, and pasted store URLs or IDs.
 //
-//   INLINE     Typing "@yourbot ghost" in any chat asks the bot for matches as
-//              you type, and Telegram renders them as a live list. This is the
-//              closest thing to the website's suggestion dropdown, and it is
-//              the reason the catalogue matters here: matching runs in memory
-//              against 12,000 names, so it answers instantly.
-//   BUTTONS    Sending a title to the bot directly. When the text matches one
-//              game it prices it; when it matches several it offers them as
-//              buttons, which is the dropdown again in a form that works in a
-//              plain chat.
-//   COMMANDS   /start, /cur, and a concept ID or store URL pasted straight in.
+// Prices take 10-40 seconds, so each lookup first posts "Looking up..." and
+// then edits that same message when the results land.
 //
-// Prices take ten to forty seconds (twenty storefronts, and a cold Render dyno
-// before them), which is far too long for a silent chat. So every lookup posts
-// "Looking up..." immediately and edits that same message when the results
-// land, rather than leaving the user wondering.
-//
-// Long polling by default: it needs no public URL and keeps the free dyno awake
-// so the next lookup is not a cold start. Set TELEGRAM_WEBHOOK_SECRET to have
-// server.js accept updates on a secret path instead.
+// Long polling by default. Set TELEGRAM_WEBHOOK_SECRET to use a webhook.
 
-// Held as a module reference, not destructured. server.js requires this file
-// back, and a circular require returns whatever the other module has exported so
-// far -- which, at the moment it loads the bot, may be nothing at all.
-// Destructuring freezes those undefined values forever; reading through the
-// reference at call time picks up the real functions once both files finish
-// loading.
+// Held as a module reference, not destructured: server.js requires this file
+// back, so at load time its exports may not exist yet. Reading through S at
+// call time picks up the real functions.
 const S = require('./server.js');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const API = process.env.TELEGRAM_API || 'https://api.telegram.org';
 const FX_URL = process.env.FX_URL || 'https://open.er-api.com/v6/latest/USD';
 
-const TOP = 5;                       // regions shown before "Show more"
+const TOP = 5;                       // regions shown before "Show More"
 const SUGGEST = 8;                   // buttons offered when a title is ambiguous
-const INLINE = 20;                   // Telegram's own cap on inline results
+const INLINE = 20;                   // Telegram's cap on inline results
 const TOP_N = 20;                    // entries in /top and /new
-const FX_TTL = 6 * 3600 * 1000;      // the rates are daily; six hours is plenty
-const CACHE_TTL = 10 * 60 * 1000;    // a "Show more" press long after the fact
+const EDITIONS_MAX = 12;             // product pages read when building the menu
+const FX_TTL = 6 * 3600 * 1000;      // rates are daily
+const CACHE_TTL = 10 * 60 * 1000;    // how long a "Show More" stays valid
 
 // ---------------------------------------------------------------- transport
 
-// Every failure here used to return null silently, which made a broken bot look
-// like an idle one: no reply, no log line, nothing to go on. Telegram explains
-// its refusals in `description`, so say so.
 async function tg(method, body, ms = 20000) {
   if (!TOKEN) return null;
   try {
@@ -62,9 +44,6 @@ async function tg(method, body, ms = 20000) {
     });
     const j = await r.json().catch(() => null);
     if (j && j.ok) return j.result;
-    // 409 means a second instance is polling the same token -- an old Render
-    // deploy still winding down, or a webhook left set. Updates go to whichever
-    // asked last, so this looks exactly like messages being ignored.
     console.error('telegram: ' + method + ' -> ' +
       ((j && (j.description || j.error_code)) || 'HTTP ' + r.status));
     return null;
@@ -82,7 +61,7 @@ async function getFx() {
   try {
     const j = await (await fetch(FX_URL, { signal: AbortSignal.timeout(10000) })).json();
     if (j && j.rates) fxCache = { rates: j.rates, ts: Date.now() };
-  } catch (e) { /* keep whatever we had: stale rates beat no prices */ }
+  } catch (e) { /* keep the old rates: stale rates beat no prices */ }
   return fxCache;
 }
 
@@ -90,11 +69,6 @@ async function getFx() {
 const convert = (price, from, to, rates) =>
   (rates && rates[from] && rates[to]) ? (price / rates[from]) * rates[to] : null;
 
-// Local prices use the disambiguated symbol, because twenty storefronts put
-// several dollars and several kroner next to each other and a bare "$" would be
-// a lie in half of them -- TWD prints NT$, UAH prints UAH. The converted column
-// uses the narrow symbol instead: it repeats on every row, the header already
-// names the currency, and "S$47.28" reads better than "SGD 47.28" twenty times.
 function money(cur, n, narrow) {
   try {
     return new Intl.NumberFormat('en', {
@@ -105,10 +79,7 @@ function money(cur, n, narrow) {
   } catch (e) { return cur + ' ' + n; }
 }
 
-// The narrow symbol for SGD is a bare "$", which is exactly the ambiguity the
-// disambiguated form exists to avoid -- and this is the column every row is
-// compared on. These are the compact-but-unambiguous forms people actually
-// write; anything not listed falls back to the narrow symbol.
+// Compact, unambiguous symbols for the converted column.
 const COMPACT = { SGD: 'S$', USD: 'US$', AUD: 'A$', CAD: 'C$', NZD: 'NZ$', HKD: 'HK$', TWD: 'NT$' };
 function converted(cur, n) {
   const p = COMPACT[cur];
@@ -119,8 +90,6 @@ function converted(cur, n) {
   }).format(n);
 }
 
-// Region codes are for the URL bar. A list of places to buy something should
-// name the places.
 const REGION_NAMES = {
   US: 'United States', UA: 'Ukraine', IN: 'India', JP: 'Japan', BR: 'Brazil',
   TR: 'Turkey', ID: 'Indonesia', MY: 'Malaysia', TW: 'Taiwan', HK: 'Hong Kong',
@@ -129,16 +98,12 @@ const REGION_NAMES = {
   DE: 'Germany', SG: 'Singapore'
 };
 
-// US -> 🇺🇸. Telegram draws these itself on every platform, so unlike the
-// website -- where Chrome on Windows has no glyphs and needs image flags --
-// the emoji are safe here.
+// US -> flag emoji. Telegram draws these on every platform.
 const flag = r => String.fromCodePoint(...[...r.toUpperCase()]
   .map(c => 0x1f1e6 + c.charCodeAt(0) - 65));
 
 // ---------------------------------------------------------------- matching
 
-// The same prefix logic the website's dropdown uses: match on the loose key so
-// punctuation, trademark signs and case cannot get in the way.
 function suggest(q, limit = SUGGEST) {
   const cat = S.getCatalog();
   const k = S.keyName(q || '');
@@ -149,8 +114,6 @@ function suggest(q, limit = SUGGEST) {
     else if (name.includes(k)) has.push([name, id]);
     if (starts.length >= limit) break;
   }
-  // Prefixes first: someone typing "ghost of" wants Ghost of Tsushima before
-  // any game with "ghost of" buried in the middle of its name.
   return [...starts, ...has].slice(0, limit).map(([name, id]) => ({
     conceptId: id,
     name: (cat.names && cat.names.get(id)) || name
@@ -161,9 +124,6 @@ function suggest(q, limit = SUGGEST) {
 
 const esc = s => ('' + s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// Ranked cheapest first in the target currency. Regions the store redirected to
-// a foreign currency are dropped: their price is real but it is not that
-// region's, so ranking them would be comparing the wrong thing.
 function rankRows(results, target, rates) {
   return results
     .filter(x => x.price != null && !x.redirected)
@@ -171,13 +131,6 @@ function rankRows(results, target, rates) {
     .sort((a, b) => (a.conv == null) - (b.conv == null) || (a.conv - b.conv));
 }
 
-// The home store, worked out from the currency being converted into: SGD -> SG,
-// EUR -> DE. A list of cheap regions means nothing without knowing what the game
-// costs at home, and the home store is usually nowhere near the top five.
-//
-// It is a button rather than a line of text: it is a reference and a link, not
-// a ranked result, and a button says both at a glance without competing with
-// the list for space.
 function homeRegion(target) {
   return Object.keys(S.EXPECT).find(r => S.EXPECT[r] === target) || null;
 }
@@ -194,27 +147,6 @@ function homeButton(pr, target, rates) {
   };
 }
 
-// Two lines per region: who and how much, then what the store itself charges.
-//
-//   1.  🇺🇦 Ukraine  ·  S$47.28
-//       U̶A̶H̶ ̶2̶,̶1̶9̶9̶  UAH 1,649  🚫 ENG
-//
-// The rank is padded to a fixed width so country names start at the same
-// indent. U+2007 FIGURE SPACE is exactly as wide as a digit, which is what it
-// exists for; ordinary spaces cannot hold a column in a proportional font, and
-// Telegram's only fixed-width context -- a code span -- allows no nesting, so it
-// would cost both the links and the strikethrough.
-//
-// On the second line the old price comes first, struck through, and the price
-// you actually pay follows it, which is the order the stores themselves use.
-// Neither is a link: the converted price above already opens the same page, and
-// three links to one destination in two lines is three chances to mistap.
-//
-// Only the absence of English is marked. A tick on nineteen rows out of twenty
-// is noise; the one row where the game is not playable in a language you read is
-// the whole point. Unknown stays blank -- the extractor reports null when a
-// storefront's spec table could not be read, and a blank is honest where "no
-// English" would be a guess.
 const FIGURE_SPACE = '\u2007';
 
 function rankLabel(i, total) {
@@ -236,15 +168,8 @@ function line(x, target, i, total) {
   return head + '\n    <i>' + bits.join('  ') + '</i>';
 }
 
-// How many editions the game has, and which storefronts disagree.
-//
-// Nearly every region lists the same editions, so one number covers the lot:
-// the count the most regions agree on. Where a storefront differs -- an extra
-// bundle sold only in Korea, say -- it is named rather than averaged away,
-// because that difference is exactly what a shopper comparing regions wants to
-// see. Regions with no priced editions at all say nothing either way.
 function editionSummary(results) {
-  const counts = new Map();                    // edition count -> regions with it
+  const counts = new Map();
   for (const x of results || []) {
     const n = (x.editions || []).length;
     if (!n) continue;
@@ -253,8 +178,6 @@ function editionSummary(results) {
   }
   if (!counts.size) return null;
 
-  // The count the most regions agree on; on a tie, the smaller count, since the
-  // extra listings are the anomaly rather than the norm.
   const common = [...counts.entries()]
     .sort((a, b) => b[1].length - a[1].length || a[0] - b[0])[0][0];
   const plural = n => n + (n === 1 ? ' Edition' : ' Editions');
@@ -274,9 +197,6 @@ function formatPrices(pr, target, rates, limit) {
   }
   const shown = rows.slice(0, limit);
   const body = shown.map((x, i) => line(x, target, i, shown.length)).join('\n');
-  // No subtitle when the rates are fine: the prices are already in order and
-  // each one carries its own currency symbol, so the line only restated what
-  // the list shows. It stays for the one case that is not self-evident.
   const head = '🎮 <b>' + esc(pr.title) + '</b>' +
     (rates ? '' : '\n<i>Local prices only — no live exchange rates</i>');
   const foot = [pr.priced + '/' + pr.total + ' Regions Priced.', editionSummary(pr.results)]
@@ -288,9 +208,6 @@ function formatPrices(pr, target, rates, limit) {
   };
 }
 
-// One row: the home price on the left as a link, "Show More" on the right when
-// there is more to show. Telegram sizes buttons to their row, so two in one row
-// read as a pair of small chips rather than two full-width bars.
 function keyboard(out, token) {
   const row = [];
   if (out.home) row.push(out.home);
@@ -298,27 +215,14 @@ function keyboard(out, token) {
   return row.length ? { inline_keyboard: [row] } : undefined;
 }
 
-// The cover art, shown as a link preview rather than a photo message.
-//
-// sendPhoto would put the artwork on top, but a photo's caption is capped at
-// 1024 characters and the expanded twenty-region list runs well past that --
-// and a caption cannot be swapped for longer text later, so pressing Show More
-// would have nowhere to put the result. A preview keeps the message a message:
-// unlimited length, editable in place, with the picture above the text.
-//
-// show_above_text puts it where a header belongs; prefer_large_media asks for
-// the full-width rendering instead of a thumbnail. Clients too old for either
-// fall back to a plain preview, and a game with no artwork gets none at all.
 const preview = image => image
   ? { url: image, prefer_large_media: true, show_above_text: true }
   : { is_disabled: true };
 
 // ---------------------------------------------------------------- state
 
-// Two small in-memory maps. Losing either on restart costs a user one repeated
-// search, so neither is worth a database.
 const target = new Map();            // chat id -> currency to convert into
-const recent = new Map();            // token -> a finished lookup, for "Show more"
+const recent = new Map();            // token -> finished lookup, for "Show More"
 
 function remember(pr) {
   const token = Math.random().toString(36).slice(2, 10);
@@ -327,28 +231,127 @@ function remember(pr) {
   return token;
 }
 
+// ---------------------------------------------------------------- editions
+
+// Prices one exact product (edition) in every storefront. A region that does
+// not sell this product ID shows no price. It never falls back to another
+// edition of the same game.
+async function editionLookup(pid) {
+  const keys = Object.keys(S.LOCALES);
+  const rows = await S.pool(keys, 6, async rk => {
+    const path = '/' + S.LOCALES[rk] + '/product/' + pid;
+    const r = await S.priceAt(path, S.acceptLang(S.LOCALES[rk]));
+    return { rk, path, r };
+  });
+  const results = rows.map(({ rk, path, r }) => ({
+    region: rk,
+    currency: r ? r.cur : null,
+    price: r ? r.price : null,
+    original: r ? r.original : null,
+    discount: r ? r.discount : null,
+    english: r ? r.english : null,
+    screenLanguages: r ? r.screenLanguages : null,
+    voiceLanguages: r ? r.voiceLanguages : null,
+    redirected: !!r && r.cur != null && !S.isAccepted(rk, r.cur),
+    foreign: !!r && S.isForeign(rk, r.cur),
+    editions: [],
+    suspect: !!(r && r.suspect),
+    via: r ? 'product' : null,
+    productId: pid,
+    url: r ? S.BASE + path : null
+  }));
+  const named = rows.find(x => x.r && x.r.name);
+  const pic = rows.find(x => x.r && x.r.image);
+  return {
+    title: named ? named.r.name : pid,
+    productId: pid,
+    conceptId: null,
+    image: pic ? pic.r.image : null,
+    results,
+    priced: results.filter(x => x.price != null).length,
+    total: results.length
+  };
+}
+
+// Editions of a game, read from its concept page in en-us. Each product link
+// there is one edition or add-on. Only products whose own page names the game
+// being looked up are kept, because the concept page also carries
+// recommendation strips for other games.
+async function editionChoices(cid, cur, rates, title) {
+  const hub = await S.getText(S.BASE + '/en-us/concept/' + cid);
+  if (!hub) return [];
+  const pids = S.productIds(hub).slice(0, EDITIONS_MAX);
+  const pages = await S.pool(pids, 4, async pid =>
+    ({ pid, h: await S.getText(S.BASE + '/en-us/product/' + pid) }));
+
+  const out = [];
+  const seen = new Set();
+  for (const { pid, h } of pages) {
+    if (!h) continue;
+    const g = S.grab(h);
+    if (g.price == null) continue;
+    if (title && !S.sameGame(g.name, title)) continue;
+
+    const conv = convert(g.price, g.cur || 'USD', cur, rates);
+    const shown = conv != null ? converted(cur, conv) : money(g.cur || 'USD', g.price, true);
+    const tail = ' · ' + shown;
+    const name = g.name || pid;
+    const room = 60 - tail.length;
+    const label = (name.length > room ? name.slice(0, Math.max(1, room - 1)) + '…' : name) + tail;
+
+    if (seen.has(label)) continue;
+    seen.add(label);
+    out.push({ pid, label });
+  }
+  return out;
+}
+
+// Edits one message into the price table.
+async function renderInto(chatId, messageId, pr, cur) {
+  const { rates } = await getFx();
+  const out = formatPrices(pr, cur, rates, TOP);
+  const token = remember(pr);
+  return tg('editMessageText', {
+    chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+    link_preview_options: preview(pr.image),
+    text: out.text,
+    reply_markup: keyboard(out, out.rows > TOP ? token : null)
+  });
+}
+
+// Posts the edition menu right after a game is priced. A game with a single
+// edition gets no menu.
+async function offerEditions(chatId, pr, cur) {
+  if (!pr.conceptId) return;
+  const { rates } = await getFx();
+  const eds = await editionChoices(pr.conceptId, cur, rates, pr.title);
+  if (eds.length < 2) return;
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text: 'Choose an edition:',
+    reply_markup: { inline_keyboard: eds.map(e => [{ text: e.label, callback_data: 'e:' + e.pid }]) }
+  });
+}
+
+async function startEdition(chatId, pid, cur) {
+  const msg = await tg('sendMessage', { chat_id: chatId, text: 'Looking up that edition…' });
+  if (!msg) return;
+  return renderInto(chatId, msg.message_id, await editionLookup(pid), cur);
+}
+
 // ---------------------------------------------------------------- flows
 
-// A title that opens the game's store page.
-//
-// The storefront follows the chat's currency rather than always being en-us:
-// someone converting into SGD wants the Singapore page, and the concept id is
-// global so the same id works on every storefront.
 function storeLink(r, loc) {
   return '<a href="https://store.playstation.com/' + (loc || 'en-us') + '/concept/' + r.conceptId +
          '"><b>' + esc(r.name) + '</b></a>';
 }
 
-// The catalogue carries the store's own popularity order for the first few
-// hundred games; everything past that is unranked and stays out of these lists.
 function topList(limit, days) {
   const cat = S.getCatalog();
   if (!cat || !cat.rows) return [];
   const cutoff = days
     ? new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
     : null;
-  // Free-to-play games are excluded: they top a best-sellers chart permanently
-  // and there is no price to compare across regions.
   return cat.rows
     .filter(r => r.rank && !r.free && (!cutoff || (r.releaseDate && r.releaseDate >= cutoff)))
     .sort((a, b) => a.rank - b.rank)
@@ -359,9 +362,10 @@ const HELP = [
   '<b>PlayStation price check</b>',
   '',
   'Send a game title and I will price it in 20 regions, cheapest first.',
+  'After that, pick an edition from the menu to price just that one.',
   '',
   '· Type <code>@BOT ghost of</code> in any chat for a live list of titles.',
-  '· A concept ID or a store URL works too.',
+  '· A concept ID, a store URL, or an edition URL works too.',
   '· <code>/top</code> — what is popular now.  <code>/new</code> — popular recent releases.',
   '· <code>/cur USD</code> changes the currency I convert into (default SGD).'
 ].join('\n');
@@ -374,19 +378,10 @@ async function priceInto(chatId, messageId, query, cur) {
       text: esc(pr.error)
     });
   }
-  const { rates } = await getFx();
-  const out = formatPrices(pr, cur, rates, TOP);
-  const token = remember(pr);
-  return tg('editMessageText', {
-    chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-    link_preview_options: preview(pr.image),
-    text: out.text,
-    reply_markup: keyboard(out, out.rows > TOP ? token : null)
-  });
+  await renderInto(chatId, messageId, pr, cur);
+  return offerEditions(chatId, pr, cur);
 }
 
-// Posts the placeholder first: twenty storefronts take far too long to leave a
-// chat silent, and editing one message reads better than a second one arriving.
 async function startLookup(chatId, query, label, cur) {
   const msg = await tg('sendMessage', {
     chat_id: chatId, parse_mode: 'HTML',
@@ -400,7 +395,6 @@ async function onText(chatId, text) {
   const cur = target.get(chatId) || 'SGD';
   const t = text.trim();
 
-  // "/start 235227" is what a tapped title in /top sends back.
   const started = t.match(/^\/start\s+(\d{5,})$/);
   if (started) {
     const cat0 = S.getCatalog();
@@ -410,9 +404,7 @@ async function onText(chatId, text) {
   if (/^\/(start|help)/.test(t)) {
     return tg('sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: HELP });
   }
-  // What is popular now, and what is popular among recent releases. Both read
-  // the catalogue in memory: no store request, so they answer instantly, unlike
-  // a price lookup.
+
   if (/^\/(top|new)\b/i.test(t)) {
     const days = /^\/new/i.test(t) ? 30 : 0;
     const n = Math.min(parseInt((t.match(/\s(\d+)/) || [])[1], 10) || TOP_N, 40);
@@ -421,8 +413,6 @@ async function onText(chatId, text) {
       return tg('sendMessage', { chat_id: chatId,
         text: 'No popularity data yet — the catalogue needs a ranking run.' });
     }
-    // A list of twenty will not fit in buttons -- Telegram would stack twenty
-    // full-width bars under the message -- so each title is a link instead.
     const loc = S.LOCALES[homeRegion(cur)] || 'en-us';
     const rows = list.map((r, i) => rankLabel(i, list.length) + '  ' + storeLink(r, loc) +
       (days && r.releaseDate ? '  <i>' + esc(r.releaseDate) + '</i>' : ''));
@@ -444,15 +434,16 @@ async function onText(chatId, text) {
     return tg('sendMessage', { chat_id: chatId, text: 'Converting into ' + c + ' from now on.' });
   }
 
-  // "/p 235227" is what an inline pick sends back; a pasted URL or bare ID is
-  // the same thing typed by hand. All go straight to the lookup.
+  // A product link is one edition: price exactly that product.
   const direct = t.replace(/^\/p\s+/, '');
+  const pm = direct.match(/\/product\/([A-Z0-9][\w-]{6,})/i);
+  if (pm) return startEdition(chatId, pm[1], cur);
+
+  // A bare ID or a concept URL goes straight to the game lookup.
   if (/^\d{5,}$/.test(direct) || /store\.playstation\.com/.test(direct)) {
     return startLookup(chatId, direct, direct, cur);
   }
 
-  // One catalogue match, or a title specific enough to resolve on its own:
-  // price it. Several matches: offer them, which is the dropdown in a chat.
   const cat = S.getCatalog();
   const exact = cat && (cat.get(S.keyName(t)) || S.catalogPrefix(t));
   if (exact) return startLookup(chatId, t, t, cur);
@@ -471,7 +462,6 @@ async function onText(chatId, text) {
       }
     });
   }
-  // Nothing catalogued: the store's own search still resolves plenty.
   return startLookup(chatId, t, t, cur);
 }
 
@@ -482,7 +472,7 @@ async function onCallback(cb) {
   if (!chatId) return;
   const cur = target.get(chatId) || 'SGD';
 
-  if (data.startsWith('g:')) {                     // a title was picked
+  if (data.startsWith('g:')) {                       // a title was picked
     const cat = S.getCatalog();
     const id = data.slice(2);
     const name = (cat && cat.names && cat.names.get(id)) || id;
@@ -492,7 +482,11 @@ async function onCallback(cb) {
     }).then(() => priceInto(chatId, cb.message.message_id, id, cur));
   }
 
-  if (data.startsWith('m:')) {                     // show every region
+  if (data.startsWith('e:')) {                       // one edition, all regions
+    return startEdition(chatId, data.slice(2), cur);
+  }
+
+  if (data.startsWith('m:')) {                        // show every region
     const hit = recent.get(data.slice(2));
     if (!hit) {
       return tg('sendMessage', { chat_id: chatId, text: 'That search has expired — send the title again.' });
@@ -502,14 +496,11 @@ async function onCallback(cb) {
     return tg('editMessageText', {
       chat_id: chatId, message_id: cb.message.message_id, parse_mode: 'HTML',
       link_preview_options: preview(hit.pr.image), text: out.text,
-      reply_markup: keyboard(out, null)      // expanded: the home link stays
+      reply_markup: keyboard(out, null)
     });
   }
 }
 
-// The live dropdown. Answers from the in-memory catalogue only -- no store
-// request, no price lookup -- because Telegram expects an inline answer in well
-// under a second and prices take tens of them.
 async function onInline(q) {
   const hits = suggest(q.query, INLINE);
   return tg('answerInlineQuery', {
@@ -527,7 +518,6 @@ async function onInline(q) {
 
 async function handleUpdate(u) {
   try {
-    // One line per update, so a quiet bot can be told apart from a deaf one.
     const what = u.inline_query ? 'inline ' + JSON.stringify(u.inline_query.query)
       : u.callback_query ? 'button ' + u.callback_query.data
       : (u.message && u.message.text) ? 'text ' + JSON.stringify(u.message.text)
@@ -538,16 +528,13 @@ async function handleUpdate(u) {
     const m = u.message || u.edited_message;
     if (m && m.text && m.chat) return await onText(m.chat.id, m.text);
   } catch (e) {
-    // One malformed update must never take the bot down.
     console.error('bot: ' + (e && e.message));
   }
 }
 
 // ---------------------------------------------------------------- polling
 
-// Long polling needs no public URL, and the open request keeps the free Render
-// dyno awake -- which also spares the next searcher a cold start.
-const POLL = 25;                       // seconds Telegram holds an empty poll open
+const POLL = 25;
 
 async function startPolling() {
   if (!TOKEN) return;
@@ -555,22 +542,21 @@ async function startPolling() {
   let offset = 0;
   console.log('telegram: polling');
   for (;;) {
-    // The abort has to outlast the long poll. It did not -- a 50 s poll under a
-    // 20 s abort was cancelled every single time, so the bot spent its life
-    // restarting the connection and answered only what happened to arrive in
-    // the first few seconds of a window.
     const ups = await tg('getUpdates',
       { offset, timeout: POLL, allowed_updates: ['message', 'callback_query', 'inline_query'] },
       (POLL + 15) * 1000);
     if (!ups) { await new Promise(r => setTimeout(r, 3000)); continue; }
     for (const u of ups) {
       offset = u.update_id + 1;
-      handleUpdate(u);                 // not awaited: a slow lookup must not
-    }                                  // stall the next person's message
+      handleUpdate(u);
+    }
   }
 }
 
 module.exports = {
   handleUpdate, startPolling, suggest, rankRows, formatPrices,
-  convert, money, converted, flag, rankLabel, editionSummary, preview, topList, storeLink, homeButton, homeRegion, keyboard, remember, recent, target, tg, hasToken: () => !!TOKEN
+  convert, money, converted, flag, rankLabel, editionSummary, preview, topList, storeLink,
+  homeButton, homeRegion, keyboard, remember, recent, target, tg,
+  editionLookup, editionChoices,
+  hasToken: () => !!TOKEN
 };
